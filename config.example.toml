@@ -1,0 +1,35 @@
+# Copy to ~/.config/devel-bar/config.toml, or use --config PATH.
+[bar]
+position = "top" # top, bottom, left, right
+show_all_workspaces = false # true shows all tags, including empty inactive ones
+thickness = 32 # logical pixels; also sets the exclusive zone (24..=96)
+font_size = 11 # logical pixels, 8..=32; must fit within thickness - 8
+# font = "JetBrainsMono Nerd Font" # optional installed family; default bundled DejaVu Sans
+
+[layout]
+start = ["workspaces"]
+center = ["title"] # focused title of this output's active workspace
+end = ["cpu", "memory", "clock"] # IDs are ordered; omit one to hide it
+
+[widgets]
+clock = true # false hides it and disables its timer
+clock_format = "12h" # 12h (default, e.g. 1:28) or 24h (e.g. 13:28)
+
+[widgets.cpu]
+interval_seconds = 2
+
+[widgets.memory]
+interval_seconds = 5
+
+# Add "weather" to [layout].end to show this opt-in, no-shell text widget:
+# [widgets.custom.weather]
+# command = ["/home/you/bin/weather-brief"]
+# interval_seconds = 600
+
+[colors]
+background = "#282a36"
+active = "#bd93f9"
+occupied = "#44475a"
+inactive = "#6272a4"
+text = "#f8f8f2"
+focused_marker = "#ffb86c"
