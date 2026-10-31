@@ -23,7 +23,7 @@ interval_seconds = 5
 
 # Add "weather" to [layout].end to show this opt-in, no-shell text widget:
 # [widgets.custom.weather]
-# command = ["/home/you/bin/weather-brief"]
+# command = ["/absolute/path/to/weather-brief"]
 # interval_seconds = 600
 
 [colors]
