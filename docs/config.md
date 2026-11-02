@@ -23,3 +23,5 @@ active = "#bd93f9"
 ```
 
 `[layout]` lists ordered widget IDs; omitting an ID hides it. `[bar] font` can name an installed family, with bundled DejaVu Sans as fallback. Custom `[widgets.custom.ID]` entries use `command = ["/absolute/program", "argument"]` and `interval_seconds = 600`; commands run as your user without a sandbox or implicit shell, so configure only trusted programs. These widgets are display-only and do not grant compositor control.
+
+Workspace clicks need devel-wm's separate `DEVEL_WM_CONTROL` socket (passed by its launcher scripts). Left-clicking a visible workspace pill switches only that output's workspace. The normal `DEVEL_WM_IPC` state subscription stays read-only; a standalone bar without a control socket has no clickable workspace actions.

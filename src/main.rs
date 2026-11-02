@@ -7,7 +7,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,10 +27,15 @@ use smithay_client_toolkit::reexports::{
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -43,7 +48,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 const DEFAULT_THICKNESS: u32 = 32;
@@ -541,6 +546,47 @@ fn laid_out_workspaces(
         }
     }
     visible
+}
+
+fn clicked_workspace(
+    visible: &[BarWorkspace],
+    position: Position,
+    major_length: usize,
+    thickness: usize,
+    x: f64,
+    y: f64,
+) -> Option<u32> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || thickness < PILL_SIZE {
+        return None;
+    }
+    let (major, minor) = if position.vertical() { (y, x) } else { (x, y) };
+    if major >= major_length as f64 || minor >= thickness as f64 {
+        return None;
+    }
+    let (major, minor) = (major.floor() as usize, minor.floor() as usize);
+    let start = pill_start(major_length);
+    let cross_start = (thickness - PILL_SIZE) / 2;
+    if major < start || !(cross_start..cross_start + PILL_SIZE).contains(&minor) {
+        return None;
+    }
+    let along = major - start;
+    inside_rounded_pill(along % PILL_STEP, minor - cross_start)
+        .then(|| visible.get(along / PILL_STEP).map(|workspace| workspace.id))
+        .flatten()
+}
+
+fn request_workspace_switch(socket: &Path, output: &str, workspace: u32) -> io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(format!("switch-workspace {output} {workspace}\n").as_bytes())?;
+    let mut response = [0; 16];
+    stream.read_exact(&mut response)?;
+    if response == *b"{\"queued\":true}\n" {
+        Ok(())
+    } else {
+        Err(io::Error::other("workspace control request rejected"))
+    }
 }
 
 fn inside_rounded_pill(x: usize, y: usize) -> bool {
@@ -1275,6 +1321,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = SlotPool::new(4, &shm)?;
     let mut bar = Bar {
         registry: RegistryState::new(&globals),
+        seats: SeatState::new(&globals, &qh),
+        pointers: Vec::new(),
         outputs: OutputState::new(&globals, &qh),
         compositor,
         shell,
@@ -1282,6 +1330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         bars: Vec::new(),
         output_filter: env::var("DEVEL_WM_OUTPUT").ok(),
+        control_socket: env::var_os("DEVEL_WM_CONTROL").map(PathBuf::from),
         clock: local_clock(SystemTime::now(), config.widgets.clock_format),
         config,
         font,
@@ -1420,6 +1469,8 @@ struct OutputBar {
 
 struct Bar {
     registry: RegistryState,
+    seats: SeatState,
+    pointers: Vec<(wl_seat::WlSeat, wl_pointer::WlPointer)>,
     outputs: OutputState,
     compositor: CompositorState,
     shell: LayerShell,
@@ -1427,6 +1478,7 @@ struct Bar {
     pool: SlotPool,
     bars: Vec<OutputBar>,
     output_filter: Option<String>,
+    control_socket: Option<PathBuf>,
     config: Config,
     font: FontArc,
     snapshot: Option<BarSnapshot>,
@@ -1436,6 +1488,57 @@ struct Bar {
 }
 
 impl Bar {
+    fn click_workspace(&self, surface: &wl_surface::WlSurface, x: f64, y: f64) {
+        let Some(socket) = self.control_socket.as_ref() else {
+            return;
+        };
+        let Some(bar) = self
+            .bars
+            .iter()
+            .find(|bar| bar.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+        let Some(monitor) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| monitor_for_output(snapshot, &bar.name))
+        else {
+            return;
+        };
+        let major_length = if self.config.bar.position.vertical() {
+            bar.height
+        } else {
+            bar.width
+        } as usize;
+        let (visible, _, _) = layout_statuses(
+            &self.config,
+            &self.font,
+            &self.statuses,
+            &self.clock,
+            Some(monitor),
+            major_length,
+        );
+        let Some(workspace) = clicked_workspace(
+            &visible,
+            self.config.bar.position,
+            major_length,
+            self.config.bar.thickness as usize,
+            x,
+            y,
+        ) else {
+            return;
+        };
+        let socket = socket.clone();
+        let output = bar.name.clone();
+        // Never block Wayland input or redraws on a socket round trip.
+        thread::spawn(move || {
+            if let Err(err) = request_workspace_switch(&socket, &output, workspace) {
+                eprintln!("devel-bar: workspace click failed: {err}");
+            }
+        });
+    }
+
     fn ensure_output(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
         let Some(name) = self.outputs.info(output).and_then(|info| info.name) else {
             // Wait for wl_output.name (or xdg-output.name) before associating
@@ -1656,9 +1759,84 @@ impl OutputHandler for Bar {
     }
 }
 
+impl SeatHandler for Bar {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seats
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer
+            && self.control_socket.is_some()
+            && !self.pointers.iter().any(|(current, _)| *current == seat)
+        {
+            match self.seats.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointers.push((seat, pointer)),
+                Err(err) => eprintln!("devel-bar: pointer unavailable: {err}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.remove_pointer(&seat);
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.remove_pointer(&seat);
+    }
+}
+
+impl Bar {
+    fn remove_pointer(&mut self, seat: &wl_seat::WlSeat) {
+        if let Some(index) = self
+            .pointers
+            .iter()
+            .position(|(current, _)| current == seat)
+        {
+            self.pointers.remove(index).1.release();
+        }
+    }
+}
+
+impl PointerHandler for Bar {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if let PointerEventKind::Press {
+                button: BTN_LEFT, ..
+            } = event.kind
+            {
+                self.click_workspace(&event.surface, event.position.0, event.position.1);
+            }
+        }
+    }
+}
+
 delegate_compositor!(Bar);
 delegate_layer!(Bar);
 delegate_output!(Bar);
+delegate_seat!(Bar);
+delegate_pointer!(Bar);
 delegate_registry!(Bar);
 delegate_shm!(Bar);
 
@@ -1666,12 +1844,49 @@ impl ProvidesRegistryState for Bar {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_clicks_follow_drawn_pills_on_all_edges_and_ignore_gaps() {
+        let visible = vec![
+            BarWorkspace {
+                id: 1,
+                occupied: false,
+                focused_window: None,
+            },
+            BarWorkspace {
+                id: 7,
+                occupied: true,
+                focused_window: None,
+            },
+        ];
+        for position in [
+            Position::Top,
+            Position::Bottom,
+            Position::Left,
+            Position::Right,
+        ] {
+            let at = |major: f64, minor: f64| {
+                let (x, y) = if position.vertical() {
+                    (minor, major)
+                } else {
+                    (major, minor)
+                };
+                clicked_workspace(&visible, position, 200, 32, x, y)
+            };
+            assert_eq!(at(20.0, 16.0), Some(1));
+            assert_eq!(at(50.0, 16.0), Some(7));
+            assert_eq!(at(34.0, 16.0), None); // between pills
+            assert_eq!(at(8.0, 4.0), None); // outside the rounded corner
+            assert_eq!(at(95.0, 16.0), None); // status/empty region
+            assert_eq!(at(-1.0, 16.0), None);
+        }
+    }
 
     fn test_font() -> FontArc {
         load_font(None)
